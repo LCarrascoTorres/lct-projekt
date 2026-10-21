@@ -1,2 +1,2 @@
 # lct-projekt
-Alles rund um die Technikerarbeit
+Alles rund um die Technikerarbeit.
