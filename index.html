@@ -278,6 +278,7 @@ const Store = {
   mark(key) {
     if (READONLY) return;
     S.changedAt = new Date().toISOString();
+    if (typeof Sync !== 'undefined') Sync.schedule();
     if (MODE === 'web') { Web.dirty = true; this.status = 'saving'; this.ui(); clearTimeout(this.t); this.t = setTimeout(() => Web.commit(), 2500); return; }
     if (MODE === 'stick') {
       this.dirty = true; this.ui();
@@ -1000,6 +1001,7 @@ function viewSettings() {
   io.append(h('p', { class: 'small muted', style: 'margin-top:0' }, MODE === 'web' ? 'Die Daten liegen verschlüsselt in Ihrem GitHub-Repository. Zusätzlich können Sie eine Sicherung (JSON) oder eine Stick-Datei herunterladen – beide sind unverschlüsselt.' : MODE === 'stick' ? 'Die Projektmappe speichert sich selbst in die HTML-Datei. Zusätzlich können Sie eine Sicherung (JSON) anlegen – damit lassen sich Daten auch in die Online-Fassung bei Claude übernehmen.' : 'Mit „Stick-Datei herunterladen“ bekommen Sie eine HTML-Datei mit allen aktuellen Daten für den USB-Stick. Eine JSON-Sicherung aus der Stick-Fassung können Sie hier einlesen.'),
     h('div', { style: 'display:flex;gap:8px;flex-wrap:wrap' }, h('button', { class: 'btn', onclick: exportJson }, 'Sicherung herunterladen (JSON)'), MODE !== 'stick' ? h('button', { class: 'btn', onclick: exportStick }, 'Stick-Datei herunterladen') : null, READONLY ? null : h('button', { class: 'btn', onclick: () => fi.click() }, 'Sicherung einlesen …'), imp, fi));
   wrap.append(io);
+  if (MODE !== 'online') wrap.append(Sync.panel());
   if (MODE !== 'stick' && !READONLY) {
     const o = h('input', { type: 'password', id: 'cp-old', autocomplete: 'current-password' }), n1 = h('input', { type: 'password', id: 'cp-new1', autocomplete: 'new-password' }), n2 = h('input', { type: 'password', id: 'cp-new2', autocomplete: 'new-password' });
     const msg = h('p', { class: 'small', role: 'status', style: 'margin:8px 0 0' });
@@ -1021,6 +1023,7 @@ function viewSettings() {
 function shell() {
   const right = $('#savebox'); right.innerHTML = '';
   right.append(h('span', { class: 'savestate', id: 'savestate', 'aria-live': 'polite' }));
+  if (MODE !== 'online') right.append(h('a', { class: 'savestate', id: 'syncstate', href: '#einstellungen', hidden: true, style: 'text-decoration:none' }));
   if (MODE === 'stick') right.append(h('button', { class: 'btn pri', onclick: () => Store.saveFile(false), title: 'Auf Stick speichern' }, '💾', h('span', { class: 'lbl' }, 'Auf Stick speichern')));
   if (MODE !== 'stick') right.append(h('button', { class: 'btn ghost', title: 'Sperren', 'aria-label': 'Projektmappe sperren', onclick: () => lockNow() }, '🔒'));
   right.append(h('a', { class: 'btn ghost', href: '#einstellungen', title: 'Einstellungen', 'aria-label': 'Einstellungen' }, '⚙'));
@@ -1039,7 +1042,7 @@ async function startStick() {
     }
   } catch (e) { }
   window.addEventListener('beforeunload', e => { if (Store.dirty) { e.preventDefault(); e.returnValue = ''; } });
-  shell(); render();
+  shell(); render(); Sync.init();
 }
 /* ===================== Verschlüsselung (nur online) ===================== */
 const Vault = {
@@ -1114,6 +1117,7 @@ function armAutoLock() {
   ['pointerdown', 'keydown', 'scroll'].forEach(ev => document.addEventListener(ev, reset, { passive: true })); reset();
 }
 async function lockNow() {
+  if (typeof Sync !== 'undefined' && Sync.t && Sync.dir && Sync.perm === 'granted') { clearTimeout(Sync.t); await Sync.writeNow(); }
   if (MODE === 'web') { if (Web.dirty) await Web.commit(); Vault.dek = null; S = null; location.hash = ''; location.reload(); return; }
   if (Store.pending.size) { for (const [k, t] of Store.pending) { clearTimeout(t); Store.write(k); } Store.pending.clear(); }
   await Promise.all([...Store.chains.values()]).catch(() => { });
@@ -1189,7 +1193,7 @@ async function startWeb() {
   $('#main').innerHTML = '<div class="empty-state"><b>Projektmappe wird geladen …</b></div>';
   if (!window.crypto?.subtle) { $('#main').innerHTML = '<div class="empty-state"><b>Verschlüsselung nicht verfügbar</b>Bitte die Seite über https öffnen.</div>'; return; }
   Web.where();
-  const open = () => { navVis(''); Store.status = 'ok'; Store.ui(); render(); armAutoLock(); };
+  const open = () => { navVis(''); Store.status = 'ok'; Store.ui(); render(); armAutoLock(); Sync.init(); };
   window.addEventListener('beforeunload', e => { if (Web.dirty) { e.preventDefault(); e.returnValue = ''; } });
   let file = null;
   if (Web.owner && Web.repo) { try { file = await Web.readPublic(); } catch (e) { $('#main').innerHTML = ''; $('#main').append(h('div', { class: 'empty-state' }, h('b', {}, 'GitHub nicht erreichbar'), e.message + ' Bitte später neu laden.')); return; } }
@@ -1230,6 +1234,230 @@ async function startWeb() {
     toast('Eingerichtet. Ihre Daten liegen jetzt verschlüsselt bei GitHub.', 5000); open();
   }, extra);
 }
+
+/* ===================== Stick-Ordner: automatische Dateien (Excel + Projektwissen) ===================== */
+const XL = {
+  crcT: (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })(),
+  crc(b) { let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = XL.crcT[(c ^ b[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; },
+  zip(files) { // files: [{name, data:Uint8Array}] – ungepackt (STORE), überall lesbar
+    const enc = new TextEncoder(); const parts = []; const cen = []; let off = 0;
+    const d = new Date(); const dt = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate(); const tm = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+    for (const f of files) {
+      const nm = enc.encode(f.name); const data = typeof f.data === 'string' ? enc.encode(f.data) : f.data; const crc = XL.crc(data);
+      const lh = new DataView(new ArrayBuffer(30)); lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true); lh.setUint16(8, 0, true); lh.setUint16(10, tm, true); lh.setUint16(12, dt, true); lh.setUint32(14, crc, true); lh.setUint32(18, data.length, true); lh.setUint32(22, data.length, true); lh.setUint16(26, nm.length, true); lh.setUint16(28, 0, true);
+      parts.push(new Uint8Array(lh.buffer), nm, data);
+      const ch = new DataView(new ArrayBuffer(46)); ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true); ch.setUint16(8, 0x0800, true); ch.setUint16(10, 0, true); ch.setUint16(12, tm, true); ch.setUint16(14, dt, true); ch.setUint32(16, crc, true); ch.setUint32(20, data.length, true); ch.setUint32(24, data.length, true); ch.setUint16(28, nm.length, true); ch.setUint32(42, off, true);
+      cen.push(new Uint8Array(ch.buffer), nm); off += 30 + nm.length + data.length;
+    }
+    const cs = cen.reduce((a, b) => a + b.length, 0); const e = new DataView(new ArrayBuffer(22)); e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true); e.setUint32(12, cs, true); e.setUint32(16, off, true);
+    const all = [...parts, ...cen, new Uint8Array(e.buffer)]; const out = new Uint8Array(all.reduce((a, b) => a + b.length, 0)); let p = 0; for (const a of all) { out.set(a, p); p += a.length; } return out;
+  },
+  x: s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, ''),
+  col(i) { let s = ''; i++; while (i) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; },
+  sheetName(n, used) { let s = String(n).replace(/[\[\]:*?\/\\]/g, ' ').slice(0, 31).trim() || 'Blatt'; let b = s, i = 2; while (used.has(s.toLowerCase())) s = b.slice(0, 28) + ' ' + i++; used.add(s.toLowerCase()); return s; },
+  // sheet: {name, cols:[{l,w,kind:'text'|'num'|'money'|'dec3'|'long'}], rows:[[...]], sum:true}
+  book(sheets) {
+    const used = new Set(); sheets.forEach(s => s.sn = XL.sheetName(s.name, used));
+    const sh = sheets.map(s => {
+      const xs = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols>'];
+      s.cols.forEach((c, i) => xs.push(`<col min="${i + 1}" max="${i + 1}" width="${Math.max(6, Math.min(70, Math.round((c.w || 120) / 7)))}" customWidth="1"/>`));
+      xs.push('</cols><sheetData>');
+      const cell = (r, i, v, st) => {
+        const ref = XL.col(i) + r; const kind = st;
+        if (v == null || v === '') return '';
+        if ((kind === 'num' || kind === 'money' || kind === 'dec3') && typeof v === 'number' && isFinite(v)) return `<c r="${ref}" s="${kind === 'money' ? 2 : kind === 'dec3' ? 3 : 0}"><v>${v}</v></c>`;
+        return `<c r="${ref}" t="inlineStr" s="${kind === 'head' ? 1 : kind === 'long' ? 4 : 0}"><is><t xml:space="preserve">${XL.x(v)}</t></is></c>`;
+      };
+      xs.push('<row r="1">' + s.cols.map((c, i) => cell(1, i, c.l, 'head')).join('') + '</row>');
+      s.rows.forEach((row, ri) => xs.push(`<row r="${ri + 2}">` + row.map((v, i) => cell(ri + 2, i, v, s.cols[i].kind)).join('') + '</row>'));
+      if (s.sum && s.rows.length) { const r = s.rows.length + 2; xs.push(`<row r="${r}">` + s.cols.map((c, i) => i === 0 ? cell(r, 0, 'Summe', 'head') : c.kind === 'money' && !c.nosum ? `<c r="${XL.col(i)}${r}" s="5"><f>SUM(${XL.col(i)}2:${XL.col(i)}${r - 1})</f></c>` : '').join('') + '</row>'); }
+      xs.push('</sheetData>');
+      if (s.rows.length) xs.push(`<autoFilter ref="A1:${XL.col(s.cols.length - 1)}${s.rows.length + 1}"/>`);
+      xs.push('<pageMargins left="0.5" right="0.5" top="0.6" bottom="0.6" header="0.3" footer="0.3"/><pageSetup orientation="landscape" paperSize="9" fitToWidth="1" fitToHeight="0"/></worksheet>');
+      return xs.join('');
+    });
+    const ct = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' + sheets.map((s, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join('') + '</Types>';
+    const rels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>';
+    const wb = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' + sheets.map((s, i) => `<sheet name="${XL.x(s.sn)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join('') + '</sheets><calcPr calcId="191029" fullCalcOnLoad="1"/></workbook>';
+    const wbr = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' + sheets.map((s, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`).join('') + `<Relationship Id="rId${sheets.length + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`;
+    const sty = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="2"><numFmt numFmtId="164" formatCode="#,##0.00\\ &quot;€&quot;"/><numFmt numFmtId="165" formatCode="0.000"/></numFmts><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FF2A1F17"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFE9DAC6"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="6"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top"/></xf><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyAlignment="1"><alignment vertical="top"/></xf><xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyAlignment="1"><alignment vertical="top"/></xf><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf><xf numFmtId="164" fontId="1" fillId="2" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1" applyFill="1"/></cellXfs><cellStyles count="1"><cellStyle name="Standard" xfId="0" builtinId="0"/></cellStyles></styleSheet>';
+    return XL.zip([{ name: '[Content_Types].xml', data: ct }, { name: '_rels/.rels', data: rels }, { name: 'xl/workbook.xml', data: wb }, { name: 'xl/_rels/workbook.xml.rels', data: wbr }, { name: 'xl/styles.xml', data: sty }, ...sh.map((x, i) => ({ name: `xl/worksheets/sheet${i + 1}.xml`, data: x }))]);
+  },
+};
+
+const Out = {
+  cellVal(c, r) { const v = c.t === 'calc' ? CALC[c.fn](r) : r[c.k]; return v; },
+  kind(c) { return c.t === 'money' || (c.t === 'calc' && c.money) ? 'money' : c.t === 'calc' ? 'dec3' : c.t === 'num' ? 'num' : c.t === 'long' ? 'long' : 'text'; },
+  xlVal(c, r) { let v = Out.cellVal(c, r); const k = Out.kind(c); if (k === 'money' || k === 'num' || k === 'dec3') { const n = toNum(typeof v === 'number' ? String(v).replace('.', ',') : v); return n == null ? (v ?? '') : n; } if (c.t === 'date') return fmtD(v); return v == null ? '' : String(v); },
+  tableSheet(t) { return { name: t.title, cols: t.cols.map(c => ({ l: c.l, w: c.w, kind: Out.kind(c), nosum: c.k === 'pr' })), rows: t.rows.map(r => t.cols.map(c => Out.xlVal(c, r))), sum: t.cols.some(c => Out.kind(c) === 'money') }; },
+  extraSheets() {
+    const ph = Object.fromEntries(S.phases.map(p => [p.id, p.n]));
+    return [
+      { name: 'Phasen', cols: [{ l: 'Phase', w: 280 }, { l: 'Stunden (Plan)', w: 110, kind: 'num' }, { l: 'Beginn', w: 100 }, { l: 'Ende', w: 100 }, { l: 'Stunden (Ist)', w: 110, kind: 'num' }], rows: S.phases.map(p => [p.n, toNum(String(p.h ?? '')) ?? '', fmtD(p.s), fmtD(p.e), S.journal.filter(j => j.ph === p.id).reduce((a, j) => a + (toNum(String(j.h ?? '').replace('.', ',')) || 0), 0)]) },
+      { name: 'Arbeitspakete', cols: [{ l: 'Phase', w: 240 }, { l: 'Arbeitspaket', w: 360 }, { l: 'Status', w: 100 }, { l: 'Fällig', w: 100 }, { l: 'Bemerkung', w: 260, kind: 'long' }], rows: S.tasks.map(t => [ph[t.ph] || '', t.n, t.st, fmtD(t.due), t.note || '']) },
+      { name: 'Tagebuch', cols: [{ l: 'Datum', w: 100 }, { l: 'Phase', w: 220 }, { l: 'Stunden', w: 80, kind: 'num' }, { l: 'Titel', w: 280 }, { l: 'Beschreibung', w: 520, kind: 'long' }], rows: S.journal.slice().sort((a, b) => (a.d || '').localeCompare(b.d || '')).map(j => [fmtD(j.d), ph[j.ph] || '', toNum(String(j.h ?? '').replace('.', ',')) ?? '', j.t || '', Out.plain(j.html)]) },
+    ];
+  },
+  plain(html) { const d = document.createElement('div'); d.innerHTML = html || ''; d.querySelectorAll('br').forEach(b => b.replaceWith('\n')); d.querySelectorAll('p,li,h1,h2,h3,h4,tr').forEach(e => e.append('\n')); d.querySelectorAll('li').forEach(e => e.prepend('• ')); return d.textContent.replace(/\n{3,}/g, '\n\n').trim(); },
+  // ---- Markdown ----
+  md(html, lvl = 3) {
+    const d = document.createElement('div'); d.innerHTML = html || '';
+    const inl = n => [...n.childNodes].map(c => c.nodeType === 3 ? c.textContent.replace(/\s+/g, ' ') : ['B', 'STRONG'].includes(c.tagName) ? `**${inl(c).trim()}**` : ['I', 'EM'].includes(c.tagName) ? `_${inl(c).trim()}_` : c.tagName === 'BR' ? '  \n' : c.tagName === 'A' ? `[${inl(c)}](${c.getAttribute('href')})` : c.tagName === 'U' || c.tagName === 'MARK' || c.tagName === 'SPAN' ? inl(c) : inl(c)).join('');
+    const blk = (n, depth = 0) => {
+      const out = [];
+      for (const c of n.childNodes) {
+        if (c.nodeType === 3) { if (c.textContent.trim()) out.push(c.textContent.trim()); continue; }
+        const t = c.tagName;
+        if (/^H[1-6]$/.test(t)) out.push('#'.repeat(Math.min(6, lvl + Math.max(0, +t[1] - 2))) + ' ' + inl(c).trim());
+        else if (t === 'UL' || t === 'OL') out.push([...c.children].filter(x => x.tagName === 'LI').map((li, i) => '  '.repeat(depth) + (t === 'OL' ? (i + 1) + '. ' : '- ') + inl(li).trim() + [...li.children].filter(x => x.tagName === 'UL' || x.tagName === 'OL').map(x => '\n' + blk({ childNodes: [x] }, depth + 1)).join('')).join('\n'));
+        else if (t === 'TABLE') { const rows = [...c.querySelectorAll('tr')].map(tr => [...tr.children].map(td => inl(td).trim().replace(/\|/g, '/'))); if (rows.length) { const n = Math.max(...rows.map(r => r.length)); const pad = r => { while (r.length < n) r.push(''); return '| ' + r.join(' | ') + ' |'; }; out.push([pad(rows[0]), '|' + '---|'.repeat(n), ...rows.slice(1).map(pad)].join('\n')); } }
+        else if (t === 'BLOCKQUOTE') out.push('> ' + inl(c).trim());
+        else if (t === 'HR') out.push('---');
+        else if (t === 'P' || t === 'DIV') { const s = inl(c).trim(); if (s) out.push(s); }
+        else { const s = inl(c).trim(); if (s) out.push(s); }
+      }
+      return out.join('\n\n');
+    };
+    return blk(d);
+  },
+  mdv(c, r) { const v = Out.cellVal(c, r); if (v == null || v === '') return ''; if (Out.kind(c) === 'money') return eur(toNum(typeof v === 'number' ? String(v).replace('.', ',') : v)); if (c.t === 'calc') return nf(v, 3); if (c.t === 'date') return fmtD(v); return String(v).replace(/\|/g, '/').replace(/\s*\n\s*/g, ' '); },
+  mdTable(key, skip = []) {
+    const t = S.tables[key]; if (!t) return '';
+    const cols = t.cols.filter(c => !skip.includes(c.k)); const L = [];
+    L.push(`## ${t.title}\n`); if (t.desc) L.push(`_${t.desc}_\n`);
+    if (!t.rows.length) { L.push('_(noch keine Einträge)_\n'); return L.join('\n'); }
+    L.push('| ' + cols.map(c => c.l).join(' | ') + ' |', '|' + '---|'.repeat(cols.length));
+    t.rows.forEach(r => L.push('| ' + cols.map(c => Out.mdv(c, r)).join(' | ') + ' |'));
+    const mc = cols.filter(c => Out.kind(c) === 'money' && c.k !== 'pr'); if (mc.length) L.push('| ' + cols.map((c, i) => i === 0 ? '**Summe**' : Out.kind(c) === 'money' && c.k !== 'pr' ? '**' + eur(t.rows.reduce((a, r) => a + (toNum(typeof Out.cellVal(c, r) === 'number' ? String(Out.cellVal(c, r)).replace('.', ',') : Out.cellVal(c, r)) || 0), 0)) + '**' : '').join(' | ') + ' |');
+    return L.join('\n') + '\n';
+  },
+  mdDoc(id) { const d = S.docs[id]; if (!d) return ''; return `## ${d.title}\n\n${Out.md(d.html, 3)}\n`; },
+  head(nr, title, purpose) { const s = S.settings; return `# ${nr} ${title}\n\n**Projekt:** ${s.title || ''}${s.school ? ' – ' + s.school : ''}  \n**Stand: ${new Date().toLocaleString('de-DE', { dateStyle: 'medium', timeStyle: 'short' })}** – automatisch aus der LCT Projektmappe erzeugt. Zweck: ${purpose}\n\n`; },
+  docsMd() {
+    const s = S.settings, o = overall(); const used = new Set(); const T = k => { used.add(k); return Out.mdTable(k); }; const D = k => { used.add('doc:' + k); return Out.mdDoc(k); };
+    const f = {};
+    f['01_Projektueberblick.md'] = Out.head('01', 'Projektüberblick', 'Rahmen, Ziele, Anforderungen und alle Entscheidungen.') +
+      `## Rahmen\n\n| Punkt | Wert |\n|---|---|\n| Projekt | ${s.title || ''} |\n| Name | ${s.name || '–'} |\n| Schule | ${s.school || ''} |\n| Start der Umsetzung | ${fmtD(s.start)} |\n| Abgabe | ${fmtD(s.end)} |\n| Präsentation | ${fmtD(s.present) || '–'} |\n| Stundenumfang | ${s.hours || ''} h |\n| Budget | ${eur(s.budget)} |\n| Seitenumfang | ca. ${s.pages || ''} Seiten |\n\n` +
+      `## Aktueller Stand\n\n- Fortschritt (erledigte Arbeitspakete, nach Phasenstunden gewichtet): **${Math.round((o.prog || 0) * 100)} %**\n- Geleistete Stunden laut Tagebuch: **${hrs(o.hours)}** von ${s.hours || 160} h\n- Tagebucheinträge: ${S.journal.length}\n\n` +
+      D('steckbrief') + '\n' + T('ziele') + '\n' + T('anforderungen') + '\n' + D('entscheidungen') + '\n' + T('aenderungen') + '\n' + D('vorgaben') + '\n' + D('notizen');
+    const ph = S.phases; let z = Out.head('02', 'Zeitplan und Arbeitspakete', 'Phasen, Arbeitspakete mit Status und geleistete Stunden.') + '## Phasen\n\n| Nr. | Phase | Stunden Plan | Stunden Ist | Beginn | Ende | Erledigt |\n|---|---|---|---|---|---|---|\n';
+    ph.forEach((p, i) => { const ts = S.tasks.filter(t => t.ph === p.id); const ist = S.journal.filter(j => j.ph === p.id).reduce((a, j) => a + (toNum(String(j.h ?? '').replace('.', ',')) || 0), 0); z += `| ${i + 1} | ${p.n} | ${p.h ?? ''} h | ${hrs(ist)} | ${fmtD(p.s)} | ${fmtD(p.e)} | ${ts.filter(t => t.st === 'erledigt').length} von ${ts.length} |\n`; });
+    z += '\n## Arbeitspakete\n\n'; ph.forEach(p => { const ts = S.tasks.filter(t => t.ph === p.id); if (!ts.length) return; z += `### ${p.n}\n\n| Arbeitspaket | Status | Fällig | Bemerkung |\n|---|---|---|---|\n` + ts.map(t => `| ${t.n} | ${t.st} | ${fmtD(t.due)} | ${(t.note || '').replace(/\|/g, '/')} |`).join('\n') + '\n\n'; });
+    f['02_Zeitplan_und_Arbeitspakete.md'] = z;
+    f['03_Technik_und_Auslegung.md'] = Out.head('03', 'Technik und Auslegung', 'Maschine, Antrieb, Aufspannplatte, Steuerschrank, Sicherheit, Software, Kamera, Messungen.') +
+      T('mf70') + '\n' + ['antrieb', 'aufspannplatte', 'steuerschrank', 'sicherheit', 'software', 'kamera'].map(D).join('\n') + '\n' + ['grbl', 'bmk', 'klemmen', 'risiko', 'messung'].map(T).join('\n');
+    const sumP = k => S.tables[k] ? S.tables[k].rows.reduce((a, r) => a + (r.st === 'entfällt' ? 0 : CALC.qpr(r)), 0) : 0;
+    const sumI = k => { const t = S.tables[k]; if (!t || !t.istCol) return 0; return t.rows.reduce((a, r) => a + (toNum(typeof r[t.istCol] === 'number' ? String(r[t.istCol]).replace('.', ',') : r[t.istCol]) || 0), 0); };
+    const cnt = k => { const t = S.tables[k]; if (!t) return ''; const d = t.rows.filter(r => DONE_ST.includes(r.st)).length; return `${d} von ${t.rows.length} erledigt (im Bestand / schon vorhanden / entfällt)`; };
+    f['04_Beschaffung_und_Bestand.md'] = Out.head('04', 'Beschaffung und Bestand', 'Was gekauft ist, was fehlt, Ist-Preise und Alternativen.') +
+      `## Kurzüberblick\n\n- Materialliste: ${cnt('material')}; Richtpreis ${eur(sumP('material'))}, bisher ausgegeben ${eur(sumI('material'))}\n- Bauhaus-Liste: ${cnt('bauhaus')}; Plan ${eur(sumP('bauhaus'))}, bisher ausgegeben ${eur(sumI('bauhaus'))}\n- Werkzeug: ${cnt('werkzeug')}\n- Sonstige Ausgaben: ${eur(sumI('ausgaben'))}\n\n` +
+      ['material', 'bauhaus', 'fehlt', 'werkzeug', 'ausgaben'].map(T).join('\n');
+    f['05_Schriftliche_Arbeit_und_Quellen.md'] = Out.head('05', 'Schriftliche Arbeit und Quellen', 'Gliederung mit Schreibstand und Quellenverzeichnis.') + '_Die schriftliche Arbeit schreibe ich selbst. Formvorgaben: Dokument 01 (Vorgaben der Schule)._\n\n' + T('gliederung') + '\n' + T('quellen');
+    let six = Out.head('06', 'Projektmappe, Links und Weiteres', 'Links, Dateien und alle weiteren Tabellen und Texte.') + `## Projektmappe\n\n- Webseite: ${location.origin + location.pathname}\n- Diese Dateien schreibt die Projektmappe automatisch in den verbundenen Stick-Ordner („LCT Aktueller Stand“).\n\n` + T('links');
+    Object.keys(S.tables).filter(k => !used.has(k)).forEach(k => six += '\n' + T(k));
+    Object.keys(S.docs).filter(k => !used.has('doc:' + k)).forEach(k => six += '\n' + D(k));
+    f['06_Projektmappe_und_Weiteres.md'] = six;
+    const phn = Object.fromEntries(S.phases.map(p => [p.id, p.n]));
+    f['08_Projekttagebuch.md'] = Out.head('08', 'Projekttagebuch', 'Alle Tagebucheinträge mit Stunden.') + (S.journal.length ? `Summe: **${hrs(o.hours)}** in ${S.journal.length} Einträgen.\n\n` + S.journal.slice().sort((a, b) => (a.d || '').localeCompare(b.d || '')).map(j => `## ${fmtD(j.d)} – ${j.t || 'ohne Titel'}\n\n_Phase: ${phn[j.ph] || '–'} · ${j.h != null && j.h !== '' ? hrs(toNum(String(j.h).replace('.', ','))) : '– h'}_\n\n${Out.md(j.html, 3)}\n`).join('\n') : '_Noch keine Einträge._\n');
+    return f;
+  },
+  files() {
+    const tb = S.tables; const sheets = Object.keys(tb).map(k => Out.tableSheet(tb[k]));
+    const files = [];
+    const one = (name, keys) => { const ks = keys.filter(k => tb[k]); if (ks.length) files.push({ name, data: XL.book(ks.map(k => Out.tableSheet(tb[k]))) }); };
+    one('Materialliste_aktuell.xlsx', ['material']);
+    one('Bauhaus_Einkaufsliste_aktuell.xlsx', ['bauhaus', 'fehlt']);
+    one('Werkzeug_und_Messmittel_aktuell.xlsx', ['werkzeug']);
+    files.push({ name: 'Alle_Tabellen_aktuell.xlsx', data: XL.book([...Out.extraSheets(), ...sheets]) });
+    const md = Out.docsMd(); for (const [n, t] of Object.entries(md)) files.push({ dir: 'Claude-Projektwissen', name: n, data: t });
+    files.push({ name: 'LCT_Sicherung_aktuell.json', data: JSON.stringify(S, null, 1) });
+    files.push({ name: 'LIESMICH.txt', data: 'LCT Projektmappe – Aktueller Stand\r\n\r\nDiese Dateien schreibt die Projektmappe (Webseite) automatisch, sobald Sie dort etwas ändern.\r\nBitte hier NICHTS von Hand ändern – Änderungen werden beim nächsten Speichern überschrieben.\r\nWer Dateien verändern will: auf der Webseite ändern.\r\n\r\n- *_aktuell.xlsx: die Listen mit allen Häkchen, Status und Ist-Preisen\r\n- Alle_Tabellen_aktuell.xlsx: jede Tabelle als eigenes Blatt, dazu Phasen, Arbeitspakete, Tagebuch\r\n- Claude-Projektwissen: Dokumente 01–06 und 08 für das Claude-Projekt (07 Chatverlauf bleibt unverändert)\r\n- LCT_Sicherung_aktuell.json: vollständige Sicherung (kann in der Projektmappe unter Einstellungen eingelesen werden)\r\n\r\nACHTUNG: Diese Dateien sind NICHT verschlüsselt. Stick gut aufbewahren.\r\n\r\nZuletzt geschrieben: ' + new Date().toLocaleString('de-DE') + '\r\n' });
+    return files;
+  },
+};
+
+const Sync = {
+  dir: null, perm: 'none', last: null, err: '', t: null, busy: false, again: false, FOLDER: 'LCT Aktueller Stand',
+  supported: () => typeof window.showDirectoryPicker === 'function',
+  db() { return new Promise((res, rej) => { const r = indexedDB.open('lct-sync', 1); r.onupgradeneeded = () => r.result.createObjectStore('h'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); },
+  async idb(op, v) { const db = await this.db(); return new Promise((res, rej) => { const tx = db.transaction('h', op === 'get' ? 'readonly' : 'readwrite'); const st = tx.objectStore('h'); const q = op === 'get' ? st.get('dir') : op === 'del' ? st.delete('dir') : st.put(v, 'dir'); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); },
+  async init() {
+    try { this.last = localStorage.getItem('lct-sync-last'); } catch (e) { }
+    if (!this.supported()) return;
+    try { this.dir = await this.idb('get'); } catch (e) { this.dir = null; }
+    if (!this.dir) { this.perm = 'none'; this.ui(); return; }
+    try { this.perm = await this.dir.queryPermission({ mode: 'readwrite' }); } catch (e) { this.perm = 'prompt'; }
+    if (this.perm === 'granted') { this.schedule(500); }
+    else if (!READONLY) { window.__banner = h('div', { class: 'banner' }, h('p', {}, `Stick-Ordner „${this.dir.name}“: Die Dateien auf dem Stick werden erst wieder aktualisiert, wenn Sie den Zugriff erlauben.`), h('button', { class: 'btn pri sm', id: 'sync-allow', onclick: () => this.allow() }, 'Stick-Zugriff erlauben'), h('button', { class: 'btn sm', onclick: () => { window.__banner = null; render(); } }, 'Später')); render(); }
+    this.ui();
+  },
+  async allow() {
+    try { this.perm = await this.dir.requestPermission({ mode: 'readwrite' }); } catch (e) { this.perm = 'prompt'; }
+    if (this.perm === 'granted') { window.__banner = null; render(); await this.writeNow(); }
+    else toast('Kein Zugriff erlaubt. Ist der Stick eingesteckt?', 5000);
+    this.ui();
+  },
+  async connect() {
+    if (!this.supported()) { toast('Das geht nur am Computer in Edge oder Chrome.', 6000); return; }
+    let d; try { d = await window.showDirectoryPicker({ id: 'lct-stick', mode: 'readwrite' }); } catch (e) { if (e && e.name === 'AbortError') return; toast('Ordner konnte nicht gewählt werden: ' + (e.message || e), 6000); return; }
+    this.dir = d; try { await this.idb('put', d); } catch (e) { }
+    try { this.perm = await d.queryPermission({ mode: 'readwrite' }); if (this.perm !== 'granted') this.perm = await d.requestPermission({ mode: 'readwrite' }); } catch (e) { this.perm = 'prompt'; }
+    window.__banner = null; this.ui();
+    if (this.perm === 'granted') { await this.writeNow(); if (!this.err) toast(`Verbunden. Die Dateien liegen jetzt in „${d.name} › ${this.FOLDER}“.`, 6000); }
+    render();
+  },
+  async disconnect() { this.dir = null; this.perm = 'none'; try { await this.idb('del'); } catch (e) { } window.__banner = null; this.ui(); render(); toast('Stick-Ordner getrennt. Die Dateien auf dem Stick bleiben erhalten.'); },
+  schedule(ms = 3000) { if (!this.dir || this.perm !== 'granted') return; clearTimeout(this.t); this.state = 'wait'; this.ui(); this.t = setTimeout(() => this.writeNow(), ms); },
+  async writeNow() {
+    if (!this.dir || !S) return; if (this.busy) { this.again = true; return; }
+    this.busy = true; this.err = ''; this.state = 'busy'; this.ui();
+    try {
+      if ((await this.dir.queryPermission({ mode: 'readwrite' })) !== 'granted') { this.perm = 'prompt'; throw new Error('Kein Zugriff – bitte „Stick-Zugriff erlauben“ klicken.'); }
+      const root = await this.dir.getDirectoryHandle(this.FOLDER, { create: true }); const subs = {}; const failed = [];
+      for (const f of Out.files()) {
+        try {
+          let d = root; if (f.dir) d = subs[f.dir] || (subs[f.dir] = await root.getDirectoryHandle(f.dir, { create: true }));
+          const fh = await d.getFileHandle(f.name, { create: true }); const w = await fh.createWritable(); await w.write(typeof f.data === 'string' ? new Blob(['﻿' + f.data], { type: 'text/plain' }) : new Blob([f.data])); await w.close();
+        } catch (e) { failed.push(f.name); }
+      }
+      if (failed.length) this.err = 'Nicht geschrieben (Datei vielleicht in Excel geöffnet?): ' + failed.join(', ');
+      this.last = new Date().toISOString(); try { localStorage.setItem('lct-sync-last', this.last); } catch (e) { }
+    } catch (e) { this.err = /NotFound|not found/i.test(String(e.name || e.message)) ? 'Stick nicht gefunden. Bitte einstecken – beim nächsten Speichern wird es erneut versucht.' : (e.message || String(e)); }
+    this.busy = false; this.state = this.err ? 'err' : 'ok'; this.ui();
+    if (this.again) { this.again = false; this.schedule(1500); }
+  },
+  downloadZip() {
+    const files = Out.files().map(f => ({ name: (f.dir ? f.dir + '/' : '') + f.name, data: typeof f.data === 'string' ? new TextEncoder().encode('﻿' + f.data) : f.data }));
+    const z = XL.zip(files); const a = h('a', { href: URL.createObjectURL(new Blob([z], { type: 'application/zip' })), download: 'LCT_Aktueller_Stand_' + todayISO() + '.zip' }); document.body.append(a); a.click(); a.remove();
+  },
+  label() {
+    if (!this.supported()) return { cls: '', txt: 'Stick-Ordner: nur in Edge/Chrome am Computer' };
+    if (!this.dir) return { cls: '', txt: 'Kein Stick-Ordner verbunden' };
+    if (this.perm !== 'granted') return { cls: 'dirty', txt: 'Stick: Zugriff erlauben' };
+    if (this.state === 'err') return { cls: 'err', txt: 'Stick: ' + this.err };
+    if (this.state === 'wait' || this.state === 'busy') return { cls: 'dirty', txt: 'Stick wird aktualisiert …' };
+    return { cls: '', txt: 'Stick aktuell' + (this.last ? ' (' + new Date(this.last).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' }) + ')' : '') };
+  },
+  ui() {
+    const el = $('#syncstate'); if (el) { const l = this.label(); el.hidden = !this.dir; el.innerHTML = `<i class="dot ${l.cls}"></i>USB<span class="lbl">: ${esc((l.txt.length > 40 ? l.txt.slice(0, 38) + '…' : l.txt).replace(/^Stick:? ?/, ''))}</span>`; el.title = l.txt; }
+    const p = $('#sync-panel-state'); if (p) { const l = this.label(); p.textContent = l.txt; p.style.color = l.cls === 'err' ? 'var(--bad)' : l.cls === 'dirty' ? 'var(--warn, #9a6a00)' : 'var(--ok)'; }
+  },
+  panel() {
+    const box = h('section', { class: 'panel', id: 'sync-panel' }, h('h3', {}, 'USB-Stick-Ordner (automatische Dateien)'));
+    box.append(h('p', { class: 'small muted', style: 'margin-top:0' }, 'Wenn ein Ordner verbunden ist, schreibt die Projektmappe nach jeder Änderung automatisch in den Unterordner „' + this.FOLDER + '“: die Excel-Listen (mit Häkchen, Status, Ist-Preisen), die Dokumente für das Claude-Projekt und eine Sicherung. Nur am Computer in Edge oder Chrome. Achtung: Diese Dateien sind nicht verschlüsselt.'));
+    if (!this.supported()) { box.append(h('p', { class: 'small' }, 'Dieser Browser kann nicht direkt in Ordner schreiben. Sie können den aktuellen Stand aber als ZIP herunterladen.'), h('button', { class: 'btn', onclick: () => this.downloadZip() }, 'Aktuellen Stand herunterladen (ZIP)')); return box; }
+    box.append(h('p', { style: 'margin:0 0 10px' }, h('b', {}, 'Status: '), h('span', { id: 'sync-panel-state' }), this.dir ? h('span', { class: 'small muted' }, ` · Ordner: ${this.dir.name} › ${this.FOLDER}`) : null));
+    const row = h('div', { style: 'display:flex;gap:8px;flex-wrap:wrap' });
+    if (!READONLY) {
+      row.append(h('button', { class: 'btn pri', id: 'sync-connect', onclick: () => this.connect() }, this.dir ? 'Anderen Ordner wählen …' : 'Stick-Ordner verbinden …'));
+      if (this.dir && this.perm !== 'granted') row.append(h('button', { class: 'btn pri', onclick: () => this.allow() }, 'Stick-Zugriff erlauben'));
+      if (this.dir && this.perm === 'granted') row.append(h('button', { class: 'btn', id: 'sync-now', onclick: () => this.writeNow().then(() => toast(this.err || 'Stick aktualisiert.')) }, 'Jetzt aktualisieren'));
+      if (this.dir) row.append(h('button', { class: 'btn', onclick: () => this.disconnect() }, 'Verbindung trennen'));
+    }
+    row.append(h('button', { class: 'btn', onclick: () => this.downloadZip() }, 'Aktuellen Stand herunterladen (ZIP)'));
+    box.append(row); setTimeout(() => this.ui(), 0); return box;
+  },
+};
 
 (MODE === 'stick' ? startStick : MODE === 'web' ? startWeb : startOnline)();
 </script><!--LCT-END--></body></html>
