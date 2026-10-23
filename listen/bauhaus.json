@@ -1,6 +1,6 @@
 {
  "stand": "22.10.2026",
- "erzeugt": "22.10.2026",
+ "erzeugt": "23.10.2026",
  "liste": [
   {
    "abt": "1 Elektro / Elektroinstallation",
@@ -56,10 +56,10 @@
    "artikel": "DIN-Trageschiene 35 × 7,5 mm, gelocht, 210 mm",
    "artnr": "12157487",
    "packung": "1 Stk, 210 mm",
-   "bedarf": "2 Stück",
-   "packungen": 2.0,
+   "bedarf": "3 Stück",
+   "packungen": 3.0,
    "preis": 4.79,
-   "achten": "Vorher Montageplatte messen: Passen 2 × 210 mm? Sonst eine dritte Schiene mitnehmen.",
+   "achten": "Eine Schiene je Ebene (3 Ebenen, Dok. 03). Neues Gehäuse 500 × 400 × 200: Montageplatte ca. 350 mm breit (Schätzung) – falls 210 mm zu kurz, eine 1-m-Schiene nehmen und kürzen.",
    "link": "https://www.bauhaus.info/p/12157487"
   },
   {
