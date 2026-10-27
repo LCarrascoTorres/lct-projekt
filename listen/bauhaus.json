@@ -1,6 +1,6 @@
 {
- "stand": "26.10.2026",
- "erzeugt": "26.10.2026",
+ "stand": "27.10.2026",
+ "erzeugt": "27.10.2026",
  "liste": [
   {
    "abt": "1 Elektro / Elektroinstallation",
@@ -107,7 +107,7 @@
    "bedarf": "1 Set",
    "packungen": 1.0,
    "preis": 12.95,
-   "achten": "Im Set sind u. a. Ringkabelschuhe – auf der Packung prüfen, ob Loch für M4/M5 dabei ist. Wenn nicht: einzelne Ringkabelschuhe am Elektroregal suchen.",
+   "achten": "Im Set sind u. a. Ringkabelschuhe – auf der Packung prüfen, ob Loch für M4/M5 dabei ist. Rev. G: Prüfen, ob isolierte Flachsteckhülsen 6,3 mm für 1,5 mm² dabei sind (nur nötig, falls -X0 Flachstecker hat). Wenn nicht: einzelne Ringkabelschuhe am Elektroregal suchen.",
    "link": "https://www.bauhaus.info/p/21996605"
   },
   {
@@ -239,7 +239,7 @@
    "bedarf": "2 Stk",
    "packungen": 2.0,
    "preis": 4.99,
-   "achten": "Gibt es in der Multimedia-Abteilung. Eins als Reserve.",
+   "achten": "Gibt es in der Multimedia-Abteilung. Eins für außen (PC → Schrank), eins als Reserve. Innen im Schrank passt A auf B nicht (Durchführung hat innen B-Buchse) – dafür B-auf-B-Kabel online (Materialliste).",
    "link": "https://www.bauhaus.info/p/30568745"
   },
   {
